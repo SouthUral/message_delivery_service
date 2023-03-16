@@ -120,12 +120,12 @@ def get_decrypted(text):
 
 if __name__ == "__main__":
     config = toml.load('./congig.toml')
-    url_rb = url_key(port=os.getenv('ASD_RABBIT_PORT'),
+    url_rb = url_key(port=os.getenv('ASD_RMQ_PORT'),
                 user=config.get('rabbit', {}).get('username'), 
                 password=get_decrypted(config.get('rabbit', {}).get('password')), 
                 connection="amqp",
-                host=os.getenv('ASD_RABBIT_HOST'),
-                spec_param=""
+                host=os.getenv('ASD_RMQ_HOST'),
+                spec_param=os.getenv('ASD_RMQ_VHOST')
                 )
     
     url_db = url_key(port=os.getenv('ASD_POSTGRES_PORT'), 
