@@ -1,10 +1,14 @@
+import os
+import json
+import toml
 import asyncio
 import aioamqp
-from asyncpg.exceptions import InterfaceError
 import asyncpg
-import json
-from loguru import logger
 import dataclasses
+
+from loguru import logger
+from cryptography.fernet import Fernet
+from asyncpg.exceptions import InterfaceError
 
 
 @dataclasses.dataclass
@@ -16,7 +20,7 @@ class url_key:
     spec_param: str = "postgres"
     connection: str = "postgresql"
 
-    def __call__(self) -> str: 
+    def __call__(self) -> str:
         return f"{self.connection}://{self.user}:{self.password}@{self.host}:{self.port}/{self.spec_param}"
 
 
@@ -47,8 +51,7 @@ class MessageTransmitter:
                 login=url.username,
                 password=url.password,
                 on_error=self.error_callback,
-                client_properties={'heartbeat': 10,
-                                   'program_name': 'some'}
+                client_properties={"heartbeat": 10, "program_name": "some"},
             )
             self.channel = await self.protocol.channel()
             logger.success("RabbitMQ connected!")
@@ -62,16 +65,17 @@ class MessageTransmitter:
         logger.error(f"RabbitMQ error: {exception}")
         asyncio.get_event_loop().stop()
 
-
     async def _check_offset(self):
-        last_value_db = await self.bd_conn.fetchrow('''select 
+        last_value_db = await self.bd_conn.fetchrow(
+            """select 
                             offset_number
                         from 
                             sh_signal.test
                         order by offset_number desc limit(1)
-                        ;''')   
+                        ;"""
+        )
         if last_value_db:
-            self.offset = last_value_db['offset_number'] + 1
+            self.offset = last_value_db["offset_number"] + 1
 
     async def _events_stream(self):
         try:
@@ -80,20 +84,19 @@ class MessageTransmitter:
             await self.channel.basic_consume(
                 callback=self._callback,
                 queue_name="new",
-                arguments={
-                    "x-stream-offset": self.offset
-                },)
+                arguments={"x-stream-offset": self.offset},
+            )
             logger.success("Сообщения прочитаны")
         except:
             logger.error(f"events_stream error")
 
     async def _callback(self, channel, body, envelope, properties):
         offset = properties.headers["x-stream-offset"]
-        message = json.dumps({'message': body.decode(), 'offset': int(offset)})
+        message = json.dumps({"message": body.decode(), "offset": int(offset)})
         logger.success(f"messages received offset:{offset}")
         await channel.basic_client_ack(delivery_tag=envelope.delivery_tag)
         try:
-            await self.bd_conn.execute('''call sh_signal.calc_quality($1)''', message)
+            await self.bd_conn.execute("""call sh_signal.calc_quality($1)""", message)
             logger.success("messages are sent to the database")
         except InterfaceError as err:
             logger.error(f"error callback 2: {err}")
@@ -107,15 +110,30 @@ class MessageTransmitter:
         logger.success(f"Close connect to PostgresQL")
 
     async def __call__(self, *args, **kwds):
-        await asyncio.gather(
-            self._connect_bd(),
-            self._connect_rb()
-            )
+        await asyncio.gather(self._connect_bd(), self._connect_rb())
         await self._events_stream()
 
+
+def get_decrypted(text):
+    return Fernet(os.getenv('ASD_CIPHER_KEY').encode()).decrypt(text.encode()).decode
+
+
 if __name__ == "__main__":
-    url_rb = url_key(port="5672", user="guest", password="guest", connection="amqp", spec_param="")
-    url_db = url_key(port="54320", user="admin", password="1234567", spec_param="db01")
+    config = toml.load('./congig.toml')
+    url_rb = url_key(port=os.getenv('ASD_RABBIT_PORT'),
+                user=config.get('rabbit', {}).get('username'), 
+                password=get_decrypted(config.get('rabbit', {}).get('password')), 
+                connection="amqp",
+                host=os.getenv('ASD_RABBIT_HOST'),
+                spec_param=""
+                )
+    
+    url_db = url_key(port=os.getenv('ASD_POSTGRES_PORT'), 
+                user=config.get('postgres', {}).get('username'), 
+                password=get_decrypted(config.get('postgres', {}).get('password')), 
+                spec_param=os.getenv('ASD_POSTGRES_DBNAME'),
+                host=os.getenv('ASD_POSTGRES_HOST')
+                )
     mt = MessageTransmitter(url_rabbit=url_rb(), url_db=url_db())
     loop = asyncio.get_event_loop()
     loop.run_until_complete(mt())

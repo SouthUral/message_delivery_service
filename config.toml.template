@@ -1,0 +1,9 @@
+version = "0.0.1"
+
+[postgres]
+username = 'admin'
+password = '1234567'
+
+[rabbit]
+username = 'guest'
+password = 'guest'
