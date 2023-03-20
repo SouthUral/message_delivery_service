@@ -4,6 +4,7 @@ import toml
 import asyncio
 import aioamqp
 import asyncpg
+import socket
 import dataclasses
 
 from loguru import logger
@@ -25,7 +26,7 @@ class url_key:
 
 
 class MessageTransmitter:
-    def __init__(self, url_rabbit: str, url_db: str):
+    def __init__(self, url_rabbit: url_key, url_db: url_key):
         self.url_rabbit = url_rabbit
         self.url_db = url_db
         self.offset = "last"
@@ -36,7 +37,7 @@ class MessageTransmitter:
 
     async def _connect_bd(self):
         try:
-            self.bd_conn = await asyncpg.connect(self.url_db)
+            self.bd_conn = await asyncpg.connect(self.url_db())
             logger.success(f"Connected to PostgresQL")
         except OSError as err:
             logger.error(f"connect_bd error: {err}")
@@ -44,21 +45,25 @@ class MessageTransmitter:
 
     async def _connect_rb(self):
         try:
-            url = aioamqp.urlparse(url=self.url_rabbit)
             self.transport, self.protocol = await aioamqp.connect(
-                host=url.hostname,
-                port=url.port,
-                login=url.username,
-                password=url.password,
+                host=self.url_rabbit.host,
+                port=self.url_rabbit.port,
+                login=self.url_rabbit.user,
+                password=self.url_rabbit.password,
+                virtualhost=self.url_rabbit.spec_param,
                 on_error=self.error_callback,
-                client_properties={"heartbeat": 10, "program_name": "some"},
+                client_properties={
+                    "heartbeat": config.get('rabbit', {}).get('heartbeat'), 
+                    "program_name": config['app'].get('name'),
+                    'hostname' : socket.gethostname(),
+                },
             )
             self.channel = await self.protocol.channel()
             logger.success("RabbitMQ connected!")
         except aioamqp.AmqpClosedConnection as err:
-            logger.error(f"RabbitMQ connection error: {err}")
+            logger.error("RabbitMQ connection error:", err)
         except OSError as err:
-            logger.error(f"RabbitMQ connection error: {err}")
+            logger.error("RabbitMQ connection error:", err)
             asyncio.get_event_loop().stop()
 
     async def error_callback(self, exception):
@@ -67,15 +72,12 @@ class MessageTransmitter:
 
     async def _check_offset(self):
         last_value_db = await self.bd_conn.fetchrow(
-            """select 
-                            offset_number
-                        from 
-                            sh_signal.test
-                        order by offset_number desc limit(1)
-                        ;"""
+            "select sh_signal.get_quality_offset() as queue_offset"
         )
         if last_value_db:
-            self.offset = last_value_db["offset_number"] + 1
+            if last_value_db["queue_offset"]:
+                self.offset = last_value_db["queue_offset"] + 1
+        logger.info(f"Offset:{self.offset}")
 
     async def _events_stream(self):
         try:
@@ -83,23 +85,26 @@ class MessageTransmitter:
             await self.channel.basic_qos(prefetch_count=1)
             await self.channel.basic_consume(
                 callback=self._callback,
-                queue_name="new",
+                queue_name=config.get('rabbit', {}).get('name_queue'),
                 arguments={"x-stream-offset": self.offset},
             )
-            logger.success("Сообщения прочитаны")
-        except:
-            logger.error(f"events_stream error")
+            logger.success("RabbitMQ init complete")
+        except Exception as _exc:
+            logger.exception(_exc)
+            asyncio.get_event_loop().stop()
 
     async def _callback(self, channel, body, envelope, properties):
         offset = properties.headers["x-stream-offset"]
-        message = json.dumps({"message": body.decode(), "offset": int(offset)})
-        logger.success(f"messages received offset:{offset}")
+        # message = json.dumps({"message": body.decode(), "offset": int(offset)})
+        message = json.loads(body)
+        logger.success(f"[{offset}] messages received")
         await channel.basic_client_ack(delivery_tag=envelope.delivery_tag)
         try:
-            await self.bd_conn.execute("""call sh_signal.calc_quality($1)""", message)
-            logger.success("messages are sent to the database")
+            if 'data' in message:
+                await self.bd_conn.execute("call sh_signal.calc_quality($1, $2)", json.dumps(message['data']), offset )
+                logger.success(f"[{offset}] messages are sent to the database")
         except InterfaceError as err:
-            logger.error(f"error callback 2: {err}")
+            logger.error(err)
             asyncio.get_event_loop().stop()
 
     async def _close(self):
@@ -115,11 +120,11 @@ class MessageTransmitter:
 
 
 def get_decrypted(text):
-    return Fernet(os.getenv('ASD_CIPHER_KEY').encode()).decrypt(text.encode()).decode
+    return Fernet(os.getenv('ASD_CIPHER_KEY').encode()).decrypt(text.encode()).decode()
 
 
 if __name__ == "__main__":
-    config = toml.load('./congig.toml')
+    config = toml.load('./config.toml')
     url_rb = url_key(port=os.getenv('ASD_RMQ_PORT'),
                 user=config.get('rabbit', {}).get('username'), 
                 password=get_decrypted(config.get('rabbit', {}).get('password')), 
@@ -134,7 +139,7 @@ if __name__ == "__main__":
                 spec_param=os.getenv('ASD_POSTGRES_DBNAME'),
                 host=os.getenv('ASD_POSTGRES_HOST')
                 )
-    mt = MessageTransmitter(url_rabbit=url_rb(), url_db=url_db())
+    mt = MessageTransmitter(url_rabbit=url_rb, url_db=url_db)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(mt())
     loop.run_forever()
